@@ -1,0 +1,7 @@
+out/
+test_out/
+core_test
+anneal_gpu
+stub/check.cpp
+__pycache__/
+*.log
