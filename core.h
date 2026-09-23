@@ -14,6 +14,9 @@
 #define QBB_CORE_H
 #include <math.h>
 #include <stdint.h>
+#if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
+#include <intrin.h>
+#endif
 
 #ifdef __CUDACC__
 #define HD __host__ __device__ __forceinline__
@@ -45,22 +48,28 @@ HD int st_bm(uint32_t s) { return (int)((s >> 17) & 0xFFFu); }
 HD int st_bc(uint32_t s) { return (int)((s >> 29) & 1u); }
 
 HD int pop64(uint64_t x) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__)
     return __popcll(x);
+#elif defined(_MSC_VER)
+    return (int)__popcnt64(x);
 #else
     return __builtin_popcountll(x);
 #endif
 }
 HD int pop32(uint32_t x) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__)
     return __popc(x);
+#elif defined(_MSC_VER)
+    return (int)__popcnt(x);
 #else
     return __builtin_popcount(x);
 #endif
 }
 HD int ctz32(uint32_t x) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__)
     return __ffs((int)x) - 1;
+#elif defined(_MSC_VER)
+    unsigned long idx; _BitScanForward(&idx, x); return (int)idx;
 #else
     return __builtin_ctz(x);
 #endif

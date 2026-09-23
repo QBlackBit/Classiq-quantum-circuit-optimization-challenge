@@ -19,6 +19,12 @@ import argparse, json, os, random, shutil, subprocess, sys, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def exe_path(name):
+    """the built engine: name.exe on Windows (whatever Python flavour runs this), else name"""
+    p = os.path.join(HERE, name)
+    return p + '.exe' if os.path.exists(p + '.exe') else p
 sys.path.insert(0, HERE)
 import selftest
 from verify import replay, verify
@@ -32,7 +38,7 @@ def log(msg):
         f.write(line + '\n')
 
 def gpu_available():
-    exe = os.path.join(HERE, 'anneal_gpu')
+    exe = exe_path('anneal_gpu')
     if not os.path.exists(exe) or shutil.which('nvidia-smi') is None:
         return False
     try:
@@ -43,7 +49,7 @@ def gpu_available():
 class Engine:
     def __init__(self, kind, chains, iters, slice_, cpus):
         self.kind, self.chains, self.iters, self.slice, self.cpus = kind, chains, iters, slice_, cpus
-        self.exe = os.path.join(HERE, 'anneal_gpu' if kind == 'gpu' else 'core_test')
+        self.exe = exe_path('anneal_gpu' if kind == 'gpu' else 'core_test')
 
     def selftest(self):
         log(f'self-test of the {self.kind} engine ...')

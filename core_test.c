@@ -6,7 +6,7 @@
 #include <math.h>
 #include <time.h>
 
-static double wall_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static double wall_s(void) { return (double)time(NULL); }   /* portable (1 s resolution is enough) */
 #include "io.h"
 
 int main(void) {

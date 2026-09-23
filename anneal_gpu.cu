@@ -61,8 +61,7 @@ __global__ void k_check(const uint32_t *circ, int *out, int n) {
     out[c] = fitness(&dP, w);
 }
 
-static double now_s(void) { return (double)clock() / CLOCKS_PER_SEC; }
-static double wall_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static double wall_s(void) { return (double)time(NULL); }   /* portable: Linux and MSVC */
 
 int main(void) {
     problem_t P; char mode[16];
@@ -136,7 +135,6 @@ int main(void) {
         }
         if (printed >= maxsol || t - t0 > tl) break;
     }
-    (void)now_s;
     printf("DONE %d %d\n", printed, best);
     return 0;
 }
