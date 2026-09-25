@@ -46,6 +46,39 @@ def gpu_available():
     except Exception:
         return False
 
+
+import threading
+_TIMEOUTS = {'consecutive': 0}
+_TLOCK = threading.Lock()
+TIMEOUT_MARGIN = int(os.environ.get('QBB_TIMEOUT_MARGIN', '900'))   # seconds allowed beyond the engine's own limit
+
+
+def run_engine(exe, txt, seconds):
+    """Run one engine process.  If it overruns its own time limit by more than the margin
+    (the machine slept, or the GPU stalled) the run is discarded with a loud WARNING and the
+    search continues; three such timeouts in a row stop the worker with an error."""
+    try:
+        p = subprocess.run([exe], input=txt, capture_output=True, text=True, timeout=seconds + TIMEOUT_MARGIN)
+    except subprocess.TimeoutExpired:
+        log(f'WARNING: an engine process exceeded its {seconds}s limit by more than {TIMEOUT_MARGIN}s '
+            f'(machine asleep or GPU stalled?) -- its results are discarded, the search continues')
+        return None
+    if p.returncode != 0:
+        raise RuntimeError(f'{exe} exited {p.returncode}: {p.stderr.strip()[-500:]}')
+    if 'DONE' not in p.stdout:
+        raise RuntimeError(f'{exe} ended without DONE line')
+    return p
+
+
+def note_run(results):
+    """count search runs (not processes) in which an engine timed out; 3 in a row -> stop"""
+    with _TLOCK:
+        _TIMEOUTS['consecutive'] = _TIMEOUTS['consecutive'] + 1 if any(r is None for r in results) else 0
+        n = _TIMEOUTS['consecutive']
+    if n >= 3:
+        raise RuntimeError('3 consecutive runs with engine timeouts: please check the machine / GPU and send out/worker.log')
+
+
 class Engine:
     def __init__(self, kind, chains, iters, slice_, cpus):
         self.kind, self.chains, self.iters, self.slice, self.cpus = kind, chains, iters, slice_, cpus
@@ -64,16 +97,15 @@ class Engine:
             runs = [txt_head + f'1000000 {self.iters} 2000 {seed * 1000 + i} {maxsol} 3.0 0.05 {seconds}\n'
                     for i in range(self.cpus)]
         def one(txt):
-            p = subprocess.run([self.exe], input=txt, capture_output=True, text=True, timeout=seconds + 600)
-            if p.returncode != 0:
-                raise RuntimeError(f'{self.exe} exited {p.returncode}: {p.stderr.strip()[-500:]}')
-            if 'DONE' not in p.stdout:
-                raise RuntimeError(f'{self.exe} ended without DONE line')
+            p = run_engine(self.exe, txt, seconds)
+            if p is None:
+                return [], 1 << 30, True
             sols = [[tuple(map(int, x.split(','))) for x in l.split()[1:]] for l in p.stdout.splitlines() if l.startswith('SOL')]
             best = int([l for l in p.stdout.splitlines() if l.startswith('DONE')][-1].split()[2])
-            return sols, best
+            return sols, best, False
         with ThreadPoolExecutor(max_workers=len(runs)) as ex:
             res = list(ex.map(one, runs))
+        note_run([None if r[2] else r for r in res])
         return [s for r in res for s in r[0]], min(r[1] for r in res)
 
 
@@ -106,11 +138,9 @@ def depth_search(eng, side, K1a, NA, seconds, seed, rep, a):
                 for i in range(eng.cpus)]
 
     def one(txt):
-        p = subprocess.run([eng.exe], input=txt, capture_output=True, text=True, timeout=seconds + 900)
-        if p.returncode != 0:
-            raise RuntimeError(f'{eng.exe} exited {p.returncode}: {p.stderr.strip()[-500:]}')
-        if 'DONE' not in p.stdout:
-            raise RuntimeError(f'{eng.exe} ended without DONE line')
+        p = run_engine(eng.exe, txt, seconds)
+        if p is None:
+            return None
         out = []
         for l in p.stdout.splitlines():
             if l.startswith('SOLD '):
@@ -118,7 +148,9 @@ def depth_search(eng, side, K1a, NA, seconds, seed, rep, a):
                 out.append((int(parts[1]), [tuple(map(int, x.split(','))) for x in parts[2:]]))
         return out
     with ThreadPoolExecutor(max_workers=len(runs)) as ex:
-        return [x for r in ex.map(one, runs) for x in r]
+        res = list(ex.map(one, runs))
+    note_run(res)
+    return [x for r in res if r is not None for x in r]
 
 
 def depth_loop(eng, P, a, state, save, t_end):
