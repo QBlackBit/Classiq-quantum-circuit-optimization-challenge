@@ -89,3 +89,42 @@ def fitness_bruteforce(init, steps, targets, npts):
     for g in fin + [full]:
         span += [x ^ g for x in span]
     return sum(min(bin(t ^ s).count('1') for s in span) for t in targets)
+
+
+def depth_model(steps, m):
+    """Independent re-implementation of the gate-level ASAP depth model
+    (tools/revdepth.c depth_est) for the self-test of the engines."""
+    lv, lu = [0] * m, [False] * m
+
+    def u3(w):
+        if not lu[w]:
+            lv[w] += 1; lu[w] = True
+
+    def cx(c, t):
+        L = max(lv[c], lv[t]) + 1
+        lv[c] = lv[t] = L; lu[c] = lu[t] = False
+
+    for t, am, ac, bm, bc in steps:
+        if am == bm and ac != bc:
+            continue
+        if am == bm:
+            for i in range(m):
+                if am >> i & 1: cx(i, t)
+            if ac: u3(t)
+            continue
+        A = [i for i in range(m) if am >> i & 1]
+        pa = next((i for i in A if not bm >> i & 1), A[0])
+        bsrc = bm
+        if bsrc >> pa & 1:
+            bsrc = (bsrc & ~(1 << pa)) ^ (am & ~(1 << pa)); bsrc |= 1 << pa
+        pb = next((i for i in range(m) if bsrc >> i & 1 and i != pa), None)
+        if pb is None:
+            continue
+        ga = [i for i in range(m) if am >> i & 1 and i != pa]
+        gb = [i for i in range(m) if bsrc >> i & 1 and i != pb]
+        for i in ga: cx(i, pa)
+        for i in gb: cx(i, pb)
+        u3(t); cx(pb, t); u3(t); cx(pa, t); u3(t); cx(pb, t); u3(t)
+        for i in reversed(gb): cx(i, pb)
+        for i in reversed(ga): cx(i, pa)
+    return max(lv) if lv else 0

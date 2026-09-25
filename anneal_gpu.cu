@@ -29,7 +29,7 @@ __global__ void k_init(uint32_t *st, int *f, uint64_t *rs, uint32_t *it, int cha
     if (c >= chains) return;
     uint64_t r = seed_of(seed, c, 0);
     uint32_t s[MAXK]; int ff; uint32_t i;
-    init_chain(&dP, s, &ff, &r, &i);
+    init_chain(&dP, s, &ff, &r, &i, dP.K1, dP.ntarg);
     for (int k = 0; k < dP.K; k++) st[(size_t)c * MAXK + k] = s[k];
     f[c] = ff; rs[c] = r; it[c] = i;
 }
@@ -41,14 +41,14 @@ __global__ void k_slice(uint32_t *st, int *f, uint64_t *rs, uint32_t *it, int ch
     uint32_t s[MAXK];
     for (int k = 0; k < dP.K; k++) s[k] = st[(size_t)c * MAXK + k];
     int ff = f[c]; uint64_t r = rs[c]; uint32_t i = it[c];
-    int got = run_slice(&dP, s, &ff, &r, &i, total, S, T0, T1);
+    int got = run_slice(&dP, s, &ff, &r, &i, total, S, T0, T1, 0, dP.K1, dP.ntarg);
     if (got) {
         int idx = atomicAdd(solcount, 1);
         if (idx < maxsol)
             for (int k = 0; k < dP.K; k++) solbuf[(size_t)idx * MAXK + k] = s[k];
     }
     atomicMin(gbest, ff);
-    if (got || i >= total) init_chain(&dP, s, &ff, &r, &i);     /* independent restart */
+    if (got || i >= total) init_chain(&dP, s, &ff, &r, &i, dP.K1, dP.ntarg);     /* independent restart */
     for (int k = 0; k < dP.K; k++) st[(size_t)c * MAXK + k] = s[k];
     f[c] = ff; rs[c] = r; it[c] = i;
 }
@@ -56,9 +56,45 @@ __global__ void k_slice(uint32_t *st, int *f, uint64_t *rs, uint32_t *it, int ch
 __global__ void k_check(const uint32_t *circ, int *out, int n) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n) return;
-    uint64_t w[MAXW];
+    tt_t w[MAXW];
     replay(&dP, circ + (size_t)c * MAXK, w);
     out[c] = fitness(&dP, w);
+}
+
+/* depth mode: every chain runs the shared state machine chain_step (core.h):
+ * correctness stage A -> stage B -> depth annealing -> report -> restart. */
+__constant__ dparams_t dD;
+
+__global__ void k_dinit(uint32_t *st, int *f, uint64_t *rs, uint32_t *it, int *ph, int *bd, int chains,
+                        unsigned long long seed) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= chains) return;
+    uint64_t r = seed_of(seed, c, 0);
+    uint32_t s[MAXK], i; int ff, p, b;
+    d_restart(&dP, &dD, s, &ff, &r, &i, &p, &b);
+    for (int k = 0; k < dP.K; k++) st[(size_t)c * MAXK + k] = s[k];
+    f[c] = ff; rs[c] = r; it[c] = i; ph[c] = p; bd[c] = b;
+}
+
+__global__ void k_dslice(uint32_t *st, int *f, uint64_t *rs, uint32_t *it, int *ph, uint32_t *bst, int *bd,
+                         int chains, int rep, uint32_t *solbuf, int *soldep, int *solcount, int maxsol, int *gbest) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= chains) return;
+    uint32_t s[MAXK], b[MAXK], out[MAXK];
+    for (int k = 0; k < dP.K; k++) { s[k] = st[(size_t)c * MAXK + k]; b[k] = bst[(size_t)c * MAXK + k]; }
+    int ff = f[c], p = ph[c], bdep = bd[c], od = 0; uint64_t r = rs[c]; uint32_t i = it[c];
+    if (chain_step(&dP, &dD, s, &ff, &r, &i, &p, b, &bdep, out, &od)) {
+        atomicMin(gbest, od);
+        if (od <= rep) {
+            int idx = atomicAdd(solcount, 1);
+            if (idx < maxsol) {
+                for (int k = 0; k < dP.K; k++) solbuf[(size_t)idx * MAXK + k] = out[k];
+                soldep[idx] = od;
+            }
+        }
+    }
+    for (int k = 0; k < dP.K; k++) { st[(size_t)c * MAXK + k] = s[k]; bst[(size_t)c * MAXK + k] = b[k]; }
+    f[c] = ff; ph[c] = p; bd[c] = bdep; rs[c] = r; it[c] = i;
 }
 
 static double wall_s(void) { return (double)time(NULL); }   /* portable: Linux and MSVC */
@@ -86,7 +122,73 @@ int main(void) {
         for (int c = 0; c < n; c++) printf("FIT %d\n", ho[c]);
         return 0;
     }
-    if (strcmp(mode, "search")) die("mode must be search or check");
+    if (!strcmp(mode, "depth")) {
+        int chains, maxsol, K1, rep; unsigned long long seed; double tl; dparams_t D;
+        if (scanf("%d %u %u %d %llu %d %f %f %d %d %d %lf %d %d", &chains, &D.it1, &D.it2, &D.S, &seed, &maxsol,
+                  &D.T0, &D.T1, &D.W, &K1, &rep, &tl, &D.K1a, &D.NA) != 14) die("bad depth params");
+        if (chains < 1 || D.it1 < 1 || D.it2 < 1 || D.S < 1 || maxsol < 1 || D.W < 1 || K1 < 1 || K1 > P.K
+            || D.T0 <= 0 || D.T1 <= 0 || D.K1a < 1 || D.K1a > K1 || D.NA < 1 || D.NA > P.ntarg) die("depth params out of range");
+        P.K1 = K1;
+        CK(cudaMemcpyToSymbol(dP, &P, sizeof P));
+        CK(cudaMemcpyToSymbol(dD, &D, sizeof D));
+        uint32_t *d_st, *d_it, *d_bst, *d_sol; int *d_f, *d_ph, *d_bd, *d_cnt, *d_best, *d_sd; uint64_t *d_rs;
+        CK(cudaMalloc(&d_st, (size_t)chains * MAXK * sizeof(uint32_t)));
+        CK(cudaMalloc(&d_bst, (size_t)chains * MAXK * sizeof(uint32_t)));
+        CK(cudaMalloc(&d_it, (size_t)chains * sizeof(uint32_t)));
+        CK(cudaMalloc(&d_f, (size_t)chains * sizeof(int)));
+        CK(cudaMalloc(&d_ph, (size_t)chains * sizeof(int)));
+        CK(cudaMalloc(&d_bd, (size_t)chains * sizeof(int)));
+        CK(cudaMalloc(&d_rs, (size_t)chains * sizeof(uint64_t)));
+        CK(cudaMalloc(&d_sol, (size_t)maxsol * MAXK * sizeof(uint32_t)));
+        CK(cudaMalloc(&d_sd, (size_t)maxsol * sizeof(int)));
+        CK(cudaMalloc(&d_cnt, sizeof(int))); CK(cudaMalloc(&d_best, sizeof(int)));
+        int zero = 0, big = 1 << 30;
+        CK(cudaMemcpy(d_cnt, &zero, sizeof(int), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_best, &big, sizeof(int), cudaMemcpyHostToDevice));
+        int blocks = (chains + TPB - 1) / TPB;
+        k_dinit<<<blocks, TPB>>>(d_st, d_f, d_rs, d_it, d_ph, d_bd, chains, seed);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        uint32_t *h_sol = (uint32_t *)malloc((size_t)maxsol * MAXK * sizeof(uint32_t));
+        int *h_sd = (int *)malloc((size_t)maxsol * sizeof(int));
+        if (!h_sol || !h_sd) die("out of host memory");
+        double t0 = wall_s(), last = t0; int printed = 0, cnt = 0, best = big;
+        while (1) {
+            k_dslice<<<blocks, TPB>>>(d_st, d_f, d_rs, d_it, d_ph, d_bst, d_bd, chains, rep,
+                                      d_sol, d_sd, d_cnt, maxsol, d_best);
+            CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(&cnt, d_cnt, sizeof(int), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(&best, d_best, sizeof(int), cudaMemcpyDeviceToHost));
+            if (cnt > maxsol) cnt = maxsol;
+            if (cnt > printed) {
+                CK(cudaMemcpy(h_sol, d_sol, (size_t)cnt * MAXK * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(h_sd, d_sd, (size_t)cnt * sizeof(int), cudaMemcpyDeviceToHost));
+                for (int q = printed; q < cnt; q++) print_depth_solution(&P, h_sol + (size_t)q * MAXK, h_sd[q]);
+                printed = cnt;
+            }
+            double t = wall_s();
+            if (t - last >= 15.0) {
+                fprintf(stderr, "progress %.0fs: %d circuits reported, best depth %d\n", t - t0, printed, best);
+                fflush(stderr); last = t;
+            }
+            if (printed >= maxsol || t - t0 > tl) break;
+        }
+        /* time is up: chains in their depth stage still hold a valid circuit -- report those too */
+        int *h_ph = (int *)malloc((size_t)chains * sizeof(int)), *h_bd = (int *)malloc((size_t)chains * sizeof(int));
+        uint32_t *h_bst = (uint32_t *)malloc((size_t)chains * MAXK * sizeof(uint32_t));
+        if (!h_ph || !h_bd || !h_bst) die("out of host memory");
+        CK(cudaMemcpy(h_ph, d_ph, (size_t)chains * sizeof(int), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(h_bd, d_bd, (size_t)chains * sizeof(int), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(h_bst, d_bst, (size_t)chains * MAXK * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        for (int c = 0; c < chains && printed < maxsol; c++) {
+            if (h_ph[c] != 2 || h_bd[c] > rep) continue;
+            if (h_bd[c] < best) best = h_bd[c];
+            print_depth_solution(&P, h_bst + (size_t)c * MAXK, h_bd[c]);
+            printed++;
+        }
+        printf("DONE %d %d\n", printed, best);
+        return 0;
+    }
+    if (strcmp(mode, "search")) die("mode must be search, check or depth");
     int chains, S, maxsol; unsigned long long seed; unsigned iters; float T0, T1; double tl;
     if (scanf("%d %u %d %llu %d %f %f %lf", &chains, &iters, &S, &seed, &maxsol, &T0, &T1, &tl) != 8) die("bad search params");
     if (chains < 1 || iters < 1 || S < 1 || maxsol < 1 || T0 <= 0 || T1 <= 0) die("search params out of range");
@@ -120,7 +222,7 @@ int main(void) {
             CK(cudaMemcpy(h_sol, d_sol, (size_t)cnt * MAXK * sizeof(uint32_t), cudaMemcpyDeviceToHost));
             for (int q = printed; q < cnt; q++) {
                 const uint32_t *st = h_sol + (size_t)q * MAXK;
-                uint64_t w[MAXW];
+                tt_t w[MAXW];
                 for (int k = 0; k < P.K; k++) if (!step_ok(&P, st[k])) die("illegal step in a GPU solution");
                 replay(&P, st, w);
                 if (fitness(&P, w) != 0) die("GPU solution fails the host fitness re-check");

@@ -27,7 +27,7 @@ def exe_path(name):
     return p + '.exe' if os.path.exists(p + '.exe') else p
 sys.path.insert(0, HERE)
 import selftest
-from verify import replay, verify
+from verify import depth_model, replay, verify
 
 LOG = None
 
@@ -53,10 +53,7 @@ class Engine:
 
     def selftest(self):
         log(f'self-test of the {self.kind} engine ...')
-        params = (f'{min(self.chains, 4096)} 200000 {self.slice} 11 4 3.0 0.05 600' if self.kind == 'gpu'
-                  else '256 200000 2000 11 4 3.0 0.05 600')
-        selftest.test_fitness([self.exe])          # sys.exit(1) on any mismatch
-        selftest.test_planted([self.exe], params)  # sys.exit(1) if planted solutions are missed
+        selftest.run_all([self.exe], self.kind)   # sys.exit(1) on any failure
         log(f'self-test of the {self.kind} engine PASSED')
 
     def search(self, init, ro, targets, K, maxform, seconds, seed, maxsol):
@@ -98,13 +95,83 @@ def run_strategy(eng, strat, side, a):
             break
     return out
 
+def depth_search(eng, side, K1a, NA, seconds, seed, rep, a):
+    """depth mode on one side -> list of (depth, steps); every circuit re-verified by the caller"""
+    head = selftest.problem_text('depth', side['npts'], side['init'], set(side['ro']), side['search_targets'],
+                                 side['K'], side['maxform'])
+    if eng.kind == 'gpu':
+        runs = [head + f"{a.chains} {a.it1} {a.it2} {a.slice} {seed} {a.maxsol} 3.0 0.05 20 {side['K1']} {rep} {seconds} {K1a} {NA}\n"]
+    else:
+        runs = [head + f"1000000 {a.it1} {a.it2} 2000 {seed * 1000 + i} {a.maxsol} 3.0 0.05 20 {side['K1']} {rep} {seconds} {K1a} {NA}\n"
+                for i in range(eng.cpus)]
+
+    def one(txt):
+        p = subprocess.run([eng.exe], input=txt, capture_output=True, text=True, timeout=seconds + 900)
+        if p.returncode != 0:
+            raise RuntimeError(f'{eng.exe} exited {p.returncode}: {p.stderr.strip()[-500:]}')
+        if 'DONE' not in p.stdout:
+            raise RuntimeError(f'{eng.exe} ended without DONE line')
+        out = []
+        for l in p.stdout.splitlines():
+            if l.startswith('SOLD '):
+                parts = l.split()
+                out.append((int(parts[1]), [tuple(map(int, x.split(','))) for x in parts[2:]]))
+        return out
+    with ThreadPoolExecutor(max_workers=len(runs)) as ex:
+        return [x for r in ex.map(one, runs) for x in r]
+
+
+def depth_loop(eng, P, a, state, save, t_end):
+    """round-robin over code sides; keeps the shallowest verified circuits per side"""
+    order = [k for k in P['order'] if (a.only == 'all' or P['sides'][k]['kind'] == a.only.rstrip('s'))
+             and P['sides'][k]['rank'] < a.top]
+    best = state.setdefault('best', {})
+    log(f'depth mode: {len(order)} sides ({a.only}), {a.per_run_seconds}s per run')
+    for rnd in range(10 ** 9):
+        for n, key in enumerate(order):
+            if time.time() > t_end:
+                log('time limit reached; stopping (re-run to resume)'); return 0
+            side = P['sides'][key]; m = len(side['init'])
+            staged = (rnd + n) % 2 == 0
+            K1a, NA = (min(12, side['K1']), 2) if staged else (side['K1'], len(side['targets']))
+            rep = best.get(key, 999)
+            seed = random.SystemRandom().randrange(1, 2**31)
+            t0 = time.time()
+            found = depth_search(eng, side, K1a, NA, a.per_run_seconds, seed, rep, a)
+            good = []
+            for d, st in found:
+                outs, err = verify(side['init'], st, side['targets'], side['ro'], side['maxform'], side['npts'])
+                if err:
+                    raise RuntimeError(f'engine returned an INVALID circuit for {key}: {err}')
+                if depth_model(st, m) != d:
+                    raise RuntimeError(f'engine reported depth {d} for {key}, independent model says {depth_model(st, m)}')
+                good.append({'depth': d, 'steps': to_lists(st, m), 'outs': [[list(x), c] for x, c in outs]})
+            rp = os.path.join(a.out, 'results', key + '.json')
+            old = json.load(open(rp))['solutions'] if os.path.exists(rp) else []
+            seen = {json.dumps(s['steps']) for s in old}
+            allsol = sorted(old + [g for g in good if json.dumps(g['steps']) not in seen], key=lambda s: s['depth'])[:32]
+            if allsol:
+                json.dump({'key': key, 'kind': side['kind'], 'masks': side['masks'], 'npts': side['npts'],
+                           'init': side['init'], 'ro': side['ro'], 'targets': side['targets'], 'solutions': allsol},
+                          open(rp + '.tmp', 'w'))
+                os.replace(rp + '.tmp', rp)
+                if allsol[0]['depth'] < best.get(key, 999):
+                    best[key] = allsol[0]['depth']
+                    log(f'*** NEW BEST {key}: depth {best[key]} ***')
+            save()
+            log(f'round {rnd} {key} ({"staged" if staged else "one-shot"}): {len(good)} verified circuits, '
+                f'best {best.get(key, "-")} ({time.time()-t0:.0f}s)')
+    return 0
+
+
 def to_lists(steps, m):
     return [[t, [i for i in range(m) if am >> i & 1], ac, [i for i in range(m) if bm >> i & 1], bc] for t, am, ac, bm, bc in steps]
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default=os.path.join(HERE, 'out'))
-    ap.add_argument('--problems', default=os.path.join(HERE, 'problems.json'))
+    ap.add_argument('--problems', default=os.path.join(HERE, 'problems.json'),
+                    help='default: the single-comparator code sides; problems_twosplit.json = the 4+4 search')
     ap.add_argument('--engine', choices=['auto', 'gpu', 'cpu'], default='auto')
     ap.add_argument('--hours', type=float, default=1000.0, help='stop after this many hours')
     ap.add_argument('--k-list', default='20,24', help='one-shot step counts to try, in order')
@@ -117,6 +184,11 @@ def main():
     ap.add_argument('--slice', type=int, default=64, help='GPU moves per kernel launch')
     ap.add_argument('--maxsol', type=int, default=64)
     ap.add_argument('--unsafe-skip-selftest', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--only', choices=['all', 'rows', 'cols'], default='all', help='depth mode: which code sides')
+    ap.add_argument('--top', type=int, default=6, help='depth mode: the N most promising codes of each kind')
+    ap.add_argument('--per-run-seconds', type=int, default=900, help='depth mode: seconds per side per run')
+    ap.add_argument('--it1', type=int, default=2000000, help='depth mode: moves per correctness attempt')
+    ap.add_argument('--it2', type=int, default=1000000, help='depth mode: moves per depth-annealing stage')
     a = ap.parse_args()
     os.makedirs(os.path.join(a.out, 'results'), exist_ok=True)
     global LOG
@@ -124,9 +196,13 @@ def main():
     t_end = time.time() + a.hours * 3600
     log(f'worker start: {" ".join(sys.argv[1:])}')
     P = json.load(open(a.problems))                       # fail fast on a missing / broken file
-    for sp in P['splits']:
-        assert len(sp['sides']) == 4 and all(k in P['sides'] for k in sp['sides']), f'bad split {sp}'
-    log(f'problems: {len(P["splits"])} splits, {len(P["sides"])} sides')
+    if P.get('mode') == 'depth':
+        assert all(k in P['sides'] for k in P['order']), 'bad order list'
+        log(f'problems: depth mode, {len(P["sides"])} sides')
+    else:
+        for sp in P['splits']:
+            assert len(sp['sides']) == 4 and all(k in P['sides'] for k in sp['sides']), f'bad split {sp}'
+        log(f'problems: {len(P["splits"])} splits, {len(P["sides"])} sides')
     kind = a.engine
     if kind == 'auto':
         kind = 'gpu' if gpu_available() else 'cpu'
@@ -153,6 +229,8 @@ def main():
     state = json.load(open(st_path)) if os.path.exists(st_path) else {'side': {}}
     def save():
         tmp = st_path + '.tmp'; json.dump(state, open(tmp, 'w'), indent=1); os.replace(tmp, st_path)
+    if P.get('mode') == 'depth':
+        return depth_loop(eng, P, a, state, save, t_end)
     klist = [int(k) for k in a.k_list.split(',') if k]
     s1list = [int(k) for k in a.stage1_k.split(',') if k]
     s2list = [int(k) for k in a.stage2_k.split(',') if k]

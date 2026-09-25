@@ -1,14 +1,27 @@
 # QBlackBit GPU search worker
 
 This worker helps the QBlackBit entry in the Classiq *Build a Better Phase Oracle*
-challenge. It searches, on an NVIDIA GPU, for small reversible circuits ("sides")
-that a two-round phase-oracle design needs. Each side must place four given Boolean
-functions of 6 input bits in the span of 9 wires. The GPU runs tens of thousands of
-independent simulated-annealing chains at once.
+challenge. It searches on an NVIDIA GPU for small reversible circuits that our oracle
+designs need. Tens of thousands of simulated-annealing chains run at once. Each chain
+first finds a *correct* circuit, then anneals it towards the *smallest depth*, using an
+exact model of the final u3/cx depth.
 
-**This is an experiment.** On a laptop these searches get close but do not finish.
-The GPU gives roughly 1000× the search volume, and we do not know in advance whether
-that is enough. Every result it reports is exact and verified.
+**Current mission (default): the single-comparator oracle.** The logo equals one
+comparison `[l(y) + mu(x,u) >= 6]`. The oracle then needs only two small circuits: a
+3-bit level code of the rows (64 points) and one of the columns (128 points). If both
+reach a depth of about 33, the whole oracle has a depth of about 120. The worker searches
+the codes round-robin and keeps the shallowest verified circuits per code.
+
+Two machines can share the work:
+
+| machine | command | searches |
+|---|---|---|
+| stronger GPU | `.\run_windows.ps1 --only cols` (or `.\run.ps1 --only cols`) | column codes (harder, 128 points) |
+| other GPU | `.\run.ps1 --only rows` | row codes |
+
+The previous mission (the 4+4 two-round search) is still available with
+`--problems problems_twosplit.json`. Stop it (Ctrl+C), `git pull`, and restart with the
+command above; the `out` folder can stay.
 
 ## What you need
 
@@ -58,11 +71,15 @@ If PowerShell refuses to run the script, allow local scripts for this session fi
 
 ## What to send back
 
-Zip the whole `out` folder and send it, at the end or whenever the log shows
+Zip the whole `out` folder and send it, at the end or whenever the log shows new
+records:
 
 ```
-*** SPLIT n COMPLETE: all four sides found -- please send the out/ folder ***
+*** NEW BEST col_5-31-20: depth 38 ***
 ```
+
+Sending it every few hours is ideal: we assemble and verify the full oracle from the
+best row and column circuits found so far.
 
 If anything goes wrong, send `out\worker.log`. Errors are never swallowed: they are
 written there with a full traceback.

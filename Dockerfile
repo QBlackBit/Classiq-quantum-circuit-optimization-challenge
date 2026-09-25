@@ -5,7 +5,7 @@ ARG CUDA_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu22.04
 FROM ${CUDA_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY core.h io.h anneal_gpu.cu core_test.c verify.py selftest.py worker.py problems.json ./
+COPY core.h io.h anneal_gpu.cu core_test.c verify.py selftest.py worker.py problems.json problems_twosplit.json ./
 RUN nvcc -O3 -std=c++17 -o anneal_gpu anneal_gpu.cu \
       -gencode arch=compute_61,code=sm_61 -gencode arch=compute_70,code=sm_70 \
       -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 \
