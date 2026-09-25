@@ -25,7 +25,7 @@
 #endif
 
 #define MAXW 12
-#define MAXK 32
+#define MAXK 48
 #define MAXT 8
 
 typedef struct { uint64_t lo, hi; } tt_t;          /* truth table: points 0-63 in lo, 64-127 in hi */

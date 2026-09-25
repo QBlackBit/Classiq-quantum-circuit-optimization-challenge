@@ -77,13 +77,18 @@ __global__ void k_dinit(uint32_t *st, int *f, uint64_t *rs, uint32_t *it, int *p
 }
 
 __global__ void k_dslice(uint32_t *st, int *f, uint64_t *rs, uint32_t *it, int *ph, uint32_t *bst, int *bd,
-                         int chains, int rep, uint32_t *solbuf, int *soldep, int *solcount, int maxsol, int *gbest) {
+                         int chains, int rep, uint32_t *solbuf, int *soldep, int *solcount, int maxsol, int *gbest,
+                         int *gfit) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= chains) return;
     uint32_t s[MAXK], b[MAXK], out[MAXK];
     for (int k = 0; k < dP.K; k++) { s[k] = st[(size_t)c * MAXK + k]; b[k] = bst[(size_t)c * MAXK + k]; }
     int ff = f[c], p = ph[c], bdep = bd[c], od = 0; uint64_t r = rs[c]; uint32_t i = it[c];
-    if (chain_step(&dP, &dD, s, &ff, &r, &i, &p, b, &bdep, out, &od)) {
+    int p_before = p;
+    int finished = chain_step(&dP, &dD, s, &ff, &r, &i, &p, b, &bdep, out, &od);
+    if (p_before < 2 && p == p_before) atomicMin(&gfit[p_before], ff);     /* closest approach per stage */
+    else if (p_before < 2) atomicMin(&gfit[p_before], 0);                   /* the stage was solved */
+    if (finished) {
         atomicMin(gbest, od);
         if (od <= rep) {
             int idx = atomicAdd(solcount, 1);
@@ -142,6 +147,9 @@ int main(void) {
         CK(cudaMalloc(&d_sol, (size_t)maxsol * MAXK * sizeof(uint32_t)));
         CK(cudaMalloc(&d_sd, (size_t)maxsol * sizeof(int)));
         CK(cudaMalloc(&d_cnt, sizeof(int))); CK(cudaMalloc(&d_best, sizeof(int)));
+        int *d_gfit; int hfit[2] = {1 << 30, 1 << 30};
+        CK(cudaMalloc(&d_gfit, 2 * sizeof(int)));
+        CK(cudaMemcpy(d_gfit, hfit, 2 * sizeof(int), cudaMemcpyHostToDevice));
         int zero = 0, big = 1 << 30;
         CK(cudaMemcpy(d_cnt, &zero, sizeof(int), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_best, &big, sizeof(int), cudaMemcpyHostToDevice));
@@ -154,7 +162,7 @@ int main(void) {
         double t0 = wall_s(), last = t0; int printed = 0, cnt = 0, best = big;
         while (1) {
             k_dslice<<<blocks, TPB>>>(d_st, d_f, d_rs, d_it, d_ph, d_bst, d_bd, chains, rep,
-                                      d_sol, d_sd, d_cnt, maxsol, d_best);
+                                      d_sol, d_sd, d_cnt, maxsol, d_best, d_gfit);
             CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
             CK(cudaMemcpy(&cnt, d_cnt, sizeof(int), cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(&best, d_best, sizeof(int), cudaMemcpyDeviceToHost));
@@ -185,7 +193,8 @@ int main(void) {
             print_depth_solution(&P, h_bst + (size_t)c * MAXK, h_bd[c]);
             printed++;
         }
-        printf("DONE %d %d\n", printed, best);
+        CK(cudaMemcpy(hfit, d_gfit, 2 * sizeof(int), cudaMemcpyDeviceToHost));
+        printf("DONE %d %d %d %d\n", printed, best, hfit[0], hfit[1]);   /* + closest approach, stages A / B */
         return 0;
     }
     if (strcmp(mode, "search")) die("mode must be search, check or depth");

@@ -146,11 +146,16 @@ def depth_search(eng, side, K1a, NA, seconds, seed, rep, a):
             if l.startswith('SOLD '):
                 parts = l.split()
                 out.append((int(parts[1]), [tuple(map(int, x.split(','))) for x in parts[2:]]))
-        return out
+        done = [l for l in p.stdout.splitlines() if l.startswith('DONE')][-1].split()
+        fits = (int(done[3]), int(done[4])) if len(done) >= 5 else (None, None)
+        return out, fits
     with ThreadPoolExecutor(max_workers=len(runs)) as ex:
         res = list(ex.map(one, runs))
     note_run(res)
-    return [x for r in res if r is not None for x in r]
+    sols = [x for r in res if r is not None for x in r[0]]
+    fa = [r[1][0] for r in res if r is not None and r[1][0] is not None]
+    fb = [r[1][1] for r in res if r is not None and r[1][1] is not None]
+    return sols, (min(fa) if fa else None, min(fb) if fb else None)
 
 
 def depth_loop(eng, P, a, state, save, t_end):
@@ -164,12 +169,12 @@ def depth_loop(eng, P, a, state, save, t_end):
             if time.time() > t_end:
                 log('time limit reached; stopping (re-run to resume)'); return 0
             side = P['sides'][key]; m = len(side['init'])
-            staged = (rnd + n) % 2 == 0
-            K1a, NA = (min(12, side['K1']), 2) if staged else (side['K1'], len(side['targets']))
+            staged = (rnd + n) % 4 != 3            # staged is much stronger (measured); one-shot 1 run in 4
+            K1a, NA = (side['K1a'], 1) if staged else (side['K1'], len(side['targets']))   # staged: one code bit first
             rep = best.get(key, 999)
             seed = random.SystemRandom().randrange(1, 2**31)
             t0 = time.time()
-            found = depth_search(eng, side, K1a, NA, a.per_run_seconds, seed, rep, a)
+            found, (fa, fb) = depth_search(eng, side, K1a, NA, a.per_run_seconds, seed, rep, a)
             good = []
             for d, st in found:
                 outs, err = verify(side['init'], st, side['targets'], side['ro'], side['maxform'], side['npts'])
@@ -191,8 +196,12 @@ def depth_loop(eng, P, a, state, save, t_end):
                     best[key] = allsol[0]['depth']
                     log(f'*** NEW BEST {key}: depth {best[key]} ***')
             save()
+            big = 1 << 30
+            closest = (f'closest: {"-" if fa in (None, big) else fa} wrong points (first bit)'
+                       f', {"-" if fb in (None, big) else fb} (all bits)') if staged else \
+                      f'closest: {"-" if fa in (None, big) else fa} wrong points'
             log(f'round {rnd} {key} ({"staged" if staged else "one-shot"}): {len(good)} verified circuits, '
-                f'best {best.get(key, "-")} ({time.time()-t0:.0f}s)')
+                f'best depth {best.get(key, "-")}; {closest} ({time.time()-t0:.0f}s)')
     return 0
 
 
