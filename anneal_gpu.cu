@@ -160,7 +160,9 @@ int main(void) {
         int *h_sd = (int *)malloc((size_t)maxsol * sizeof(int));
         if (!h_sol || !h_sd) die("out of host memory");
         double t0 = wall_s(), last = t0; int printed = 0, cnt = 0, best = big;
+        unsigned long long dmoves = 0;                          /* upper bound: chains * S per slice */
         while (1) {
+            dmoves += (unsigned long long)chains * (unsigned long long)D.S;
             k_dslice<<<blocks, TPB>>>(d_st, d_f, d_rs, d_it, d_ph, d_bst, d_bd, chains, rep,
                                       d_sol, d_sd, d_cnt, maxsol, d_best, d_gfit);
             CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
@@ -175,7 +177,7 @@ int main(void) {
             }
             double t = wall_s();
             if (t - last >= 15.0) {
-                fprintf(stderr, "progress %.0fs: %d circuits reported, best depth %d\n", t - t0, printed, best);
+                fprintf(stderr, "progress %.0fs: %.3g moves, %d circuits reported, best depth %d\n", t - t0, (double)dmoves, printed, best);
                 fflush(stderr); last = t;
             }
             if (printed >= maxsol || t - t0 > tl) break;
@@ -194,7 +196,7 @@ int main(void) {
             printed++;
         }
         CK(cudaMemcpy(hfit, d_gfit, 2 * sizeof(int), cudaMemcpyDeviceToHost));
-        printf("DONE %d %d %d %d\n", printed, best, hfit[0], hfit[1]);   /* + closest approach, stages A / B */
+        printf("DONE %d %d %d %d %llu %.1f\n", printed, best, hfit[0], hfit[1], dmoves, wall_s() - t0);  /* + closest per stage, moves, seconds */
         return 0;
     }
     if (strcmp(mode, "search")) die("mode must be search, check or depth");

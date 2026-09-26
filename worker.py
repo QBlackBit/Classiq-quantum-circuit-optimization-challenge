@@ -148,14 +148,16 @@ def depth_search(eng, side, K1a, NA, seconds, seed, rep, a):
                 out.append((int(parts[1]), [tuple(map(int, x.split(','))) for x in parts[2:]]))
         done = [l for l in p.stdout.splitlines() if l.startswith('DONE')][-1].split()
         fits = (int(done[3]), int(done[4])) if len(done) >= 5 else (None, None)
-        return out, fits
+        speed = int(done[5]) / max(1.0, float(done[6])) if len(done) >= 7 else None     # moves per second
+        return out, fits + (speed,)
     with ThreadPoolExecutor(max_workers=len(runs)) as ex:
         res = list(ex.map(one, runs))
     note_run(res)
     sols = [x for r in res if r is not None for x in r[0]]
     fa = [r[1][0] for r in res if r is not None and r[1][0] is not None]
     fb = [r[1][1] for r in res if r is not None and r[1][1] is not None]
-    return sols, (min(fa) if fa else None, min(fb) if fb else None)
+    sp = [r[1][2] for r in res if r is not None and r[1][2]]
+    return sols, (min(fa) if fa else None, min(fb) if fb else None, sum(sp) if sp else None)
 
 
 def depth_loop(eng, P, a, state, save, t_end):
@@ -174,7 +176,16 @@ def depth_loop(eng, P, a, state, save, t_end):
             rep = best.get(key, 999)
             seed = random.SystemRandom().randrange(1, 2**31)
             t0 = time.time()
-            found, (fa, fb) = depth_search(eng, side, K1a, NA, a.per_run_seconds, seed, rep, a)
+            found, (fa, fb, speed) = depth_search(eng, side, K1a, NA, a.per_run_seconds, seed, rep, a)
+            if eng.kind == 'gpu' and speed and not a.fixed_chains:
+                # every chain must finish several annealing schedules per run, or no chain ever cools down
+                want = int(speed * a.per_run_seconds / (a.min_schedules * (a.it1 + a.it2)))
+                want = max(256, min(65536, want // 256 * 256))
+                if want != a.chains:
+                    log(f'GPU speed {speed:.3g} moves/s -> {want} chains (was {a.chains}), '
+                        f'so each chain completes >= {a.min_schedules} schedules per run')
+                    a.chains = want
+                    state['chains'] = want
             good = []
             for d, st in found:
                 outs, err = verify(side['init'], st, side['targets'], side['ro'], side['maxform'], side['npts'])
@@ -220,7 +231,7 @@ def main():
     ap.add_argument('--stage2-k', default='10,14', help='staged search: extra steps for all features')
     ap.add_argument('--stage1-keep', type=int, default=4, help='stage-1 circuits continued into stage 2')
     ap.add_argument('--per-k-seconds', type=int, default=240)
-    ap.add_argument('--chains', type=int, default=65536, help='GPU chains')
+    ap.add_argument('--chains', type=int, default=8192, help='GPU chains (auto-tuned in depth mode)')
     ap.add_argument('--iters', type=int, default=400000, help='moves per chain before a restart')
     ap.add_argument('--slice', type=int, default=64, help='GPU moves per kernel launch')
     ap.add_argument('--maxsol', type=int, default=64)
@@ -228,8 +239,10 @@ def main():
     ap.add_argument('--only', choices=['all', 'rows', 'cols'], default='all', help='depth mode: which code sides')
     ap.add_argument('--top', type=int, default=6, help='depth mode: the N most promising codes of each kind')
     ap.add_argument('--per-run-seconds', type=int, default=900, help='depth mode: seconds per side per run')
-    ap.add_argument('--it1', type=int, default=2000000, help='depth mode: moves per correctness attempt')
-    ap.add_argument('--it2', type=int, default=1000000, help='depth mode: moves per depth-annealing stage')
+    ap.add_argument('--it1', type=int, default=1000000, help='depth mode: moves per correctness attempt')
+    ap.add_argument('--it2', type=int, default=500000, help='depth mode: moves per depth-annealing stage')
+    ap.add_argument('--min-schedules', type=int, default=4, help='GPU: complete annealing schedules per chain per run')
+    ap.add_argument('--fixed-chains', action='store_true', help='GPU: do not auto-tune the chain count')
     a = ap.parse_args()
     os.makedirs(os.path.join(a.out, 'results'), exist_ok=True)
     global LOG
@@ -271,6 +284,8 @@ def main():
     def save():
         tmp = st_path + '.tmp'; json.dump(state, open(tmp, 'w'), indent=1); os.replace(tmp, st_path)
     if P.get('mode') == 'depth':
+        if state.get('chains') and not a.fixed_chains:
+            a.chains = state['chains']; log(f'GPU chains from the previous tuning: {a.chains}')
         return depth_loop(eng, P, a, state, save, t_end)
     klist = [int(k) for k in a.k_list.split(',') if k]
     s1list = [int(k) for k in a.stage1_k.split(',') if k]

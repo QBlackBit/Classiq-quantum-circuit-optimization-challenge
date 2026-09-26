@@ -26,6 +26,7 @@ int main(void) {
             || D.K1a < 1 || D.K1a > K1 || D.NA < 1 || D.NA > P.ntarg) die("depth params out of range");
         P.K1 = K1;
         int nsol = 0, best = 1 << 30, gfit[2] = {1 << 30, 1 << 30}; double t0 = wall_s();
+        unsigned long long dmoves = 0;
         for (int c = 0; c < chains && nsol < maxsol && wall_s() - t0 <= tl; c++) {
             uint64_t rs = (seed + 1) * 0x9E3779B97F4A7C15ULL + (uint64_t)(c + 1) * 0xBF58476D1CE4E5B9ULL; if (!rs) rs = 1;
             uint32_t st[MAXK], bst[MAXK], out[MAXK], it; int f, ph, bd, od;
@@ -34,6 +35,7 @@ int main(void) {
             while (wall_s() - t0 <= tl) {                   /* one chain until its first depth stage ends */
                 int ph_before = ph;
                 int finished = chain_step(&P, &D, st, &f, &rs, &it, &ph, bst, &bd, out, &od);
+                dmoves += (unsigned long long)D.S;
                 if (ph_before < 2) {                            /* closest approach per stage */
                     int v = (ph == ph_before) ? f : 0;
                     if (v < gfit[ph_before]) gfit[ph_before] = v;
@@ -51,7 +53,7 @@ int main(void) {
                 if (bd <= rep) { print_depth_solution(&P, bst, bd); nsol++; }
             }
         }
-        printf("DONE %d %d %d %d\n", nsol, best, gfit[0], gfit[1]);   /* + closest approach, stages A / B */
+        printf("DONE %d %d %d %d %llu %.1f\n", nsol, best, gfit[0], gfit[1], dmoves, wall_s() - t0);  /* + closest per stage, moves, seconds */
         return 0;
     }
     if (!strcmp(mode, "check")) {
